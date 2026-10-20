@@ -1,0 +1,83 @@
+# Live Bet Tracker refresh for the ChromePicks board (source of truth: /workspace/fanduel/gh_live/live-tracker.yml on the box).
+# No data lives in this public repo: the job pulls a private bundle (chromepicks/live-tracker-data, read-only deploy key),
+# rebuilds the tracker on index.html, StatiCrypt-encrypts it and pushes it to the two GitHub Pages repos (write deploy keys).
+# Logs print counts/status only.
+name: live-tracker
+on:
+  schedule:
+    # GitHub cron is UTC and best-effort. Covers CT 1pm-midnight weekdays and 11am-midnight weekends,
+    # in both CDT (UTC-5) and CST (UTC-6). Each run exits in ~30 s unless a tracked game is live or starts within 30 min.
+    - cron: '*/5 18-23 * * 1-5'   # Mon-Fri 18:00-23:55 UTC
+    - cron: '*/5 16-23 * * 0,6'   # Sat/Sun 16:00-23:55 UTC
+    - cron: '*/5 0-5 * * *'       # every night 00:00-05:55 UTC (= previous CT evening until ~midnight)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'check = normal; force = test: always rebuild + publish once (and probe the stats APIs)'
+        type: choice
+        options: [check, force]
+        default: check
+      loop:
+        description: 'force mode only: keep looping like a live run (1) instead of a single pass (0)'
+        type: choice
+        options: ['0', '1']
+        default: '0'
+concurrency:
+  group: live-tracker
+  cancel-in-progress: false
+permissions:
+  contents: write   # only used by the keepalive step (stops GitHub disabling the schedule after 60 idle days)
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Keys and private bundle
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_DEPLOY_KEY }}
+          KEY_IO: ${{ secrets.PAGES_KEY_IO }}
+          KEY_BOARD: ${{ secrets.PAGES_KEY_BOARD }}
+        run: |
+          install -m 700 -d ~/.ssh
+          umask 077
+          printf '%s\n' "$BUNDLE_KEY" > ~/.ssh/bundle_key
+          printf '%s\n' "$KEY_IO" > ~/.ssh/pages_io
+          printf '%s\n' "$KEY_BOARD" > ~/.ssh/pages_board
+          cat > ~/.ssh/known_hosts <<'KH'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          KH
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/bundle_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts" \
+            git clone -q --depth 1 --branch bundle git@github.com:chromepicks/live-tracker-data.git "$RUNNER_TEMP/bundle"
+          cp -r "$RUNNER_TEMP/bundle/gh_live" "$RUNNER_TEMP/gh_live_run"
+      - name: Tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv" && "$RUNNER_TEMP/venv/bin/pip" -q install requests==2.32.3
+          mkdir -p "$RUNNER_TEMP/nodetools" && cp "$RUNNER_TEMP/bundle/tools/package.json" "$RUNNER_TEMP/bundle/tools/package-lock.json" "$RUNNER_TEMP/nodetools/"
+          cd "$RUNNER_TEMP/nodetools" && npm ci --silent --no-audit --no-fund
+      - name: Refresh tracker (loops while a tracked game is live, max 5.5 h)
+        env:
+          BOARD_SITE_PASSWORD: ${{ secrets.BOARD_SITE_PASSWORD }}
+          MODE: ${{ inputs.mode || 'check' }}
+          FORCE_LOOP: ${{ inputs.loop || '0' }}
+          BUNDLE: ${{ runner.temp }}/bundle
+          NODE_TOOLS: ${{ runner.temp }}/nodetools
+          VPY: ${{ runner.temp }}/venv/bin/python
+          TZ: America/Chicago
+        run: bash "$RUNNER_TEMP/gh_live_run/run.sh"
+      - name: Keepalive (commit at most once every 30 days)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh api "repos/$GITHUB_REPOSITORY/commits?per_page=1" --jq '.[0].commit.committer.date' 2>/dev/null || echo "")
+          if [ -n "$last" ] && [ $(( $(date +%s) - $(date -d "$last" +%s) )) -gt 2592000 ]; then
+            sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/KEEPALIVE" --jq .sha 2>/dev/null || echo "")
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/KEEPALIVE" -f message="keepalive" \
+              -f content="$(date -u +%FT%TZ | base64)" ${sha:+-f sha="$sha"} >/dev/null && echo "keepalive committed"
+          else
+            echo "keepalive not needed"
+          fi
+      - name: Cleanup keys
+        if: always()
+        run: rm -f ~/.ssh/bundle_key ~/.ssh/pages_io ~/.ssh/pages_board
