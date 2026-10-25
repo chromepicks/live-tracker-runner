@@ -5,11 +5,10 @@
 name: live-tracker
 on:
   schedule:
-    # GitHub cron is UTC and best-effort. Covers CT 1pm-midnight weekdays and 11am-midnight weekends,
-    # in both CDT (UTC-5) and CST (UTC-6). Each run exits in ~30 s unless a tracked game is live or starts within 30 min.
-    - cron: '*/5 18-23 * * 1-5'   # Mon-Fri 18:00-23:55 UTC
-    - cron: '*/5 16-23 * * 0,6'   # Sat/Sun 16:00-23:55 UTC
-    - cron: '*/5 0-5 * * *'       # every night 00:00-05:55 UTC (= previous CT evening until ~midnight)
+    # GitHub cron is UTC and best-effort. amtrack1025: every 5 min, 24/7, so any pending bet whose game is in progress
+    # is tracked (international NFL kicks off 8:30 AM CT; old windows started 11 AM CT weekends / 1 PM weekdays).
+    # Each run exits in ~30 s unless a tracked game is live or starts within 30 min.
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       mode:
